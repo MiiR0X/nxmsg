@@ -1265,10 +1265,7 @@ wss.on('connection', (ws) => {
           android: {
             priority: 'high',
             ttl: 30000,
-            notification: {
-              channelId: 'nxmsg_calls',
-              sound: 'default'
-            }
+            directBootOk: true
           }
         });
         break;
