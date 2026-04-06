@@ -81,6 +81,68 @@ const messages = new Map();
 const wsClients = new Map();
 const sessions = new Map();
 const deviceTokens = new Map();
+const activeCalls = new Map();
+
+function getCallById(callId) {
+  if (!callId) return null;
+  return activeCalls.get(callId) || null;
+}
+
+function getCallByUser(userId) {
+  for (const call of activeCalls.values()) {
+    if (call.fromId === userId || call.toId === userId) return call;
+  }
+  return null;
+}
+
+function clearCallTimeout(call) {
+  if (call?.timeoutHandle) {
+    clearTimeout(call.timeoutHandle);
+    call.timeoutHandle = null;
+  }
+}
+
+function removeActiveCall(callId) {
+  const call = activeCalls.get(callId);
+  if (!call) return null;
+  clearCallTimeout(call);
+  activeCalls.delete(callId);
+  return call;
+}
+
+function sendCallPayload(userId, payload) {
+  if (!userId) return false;
+  return sendToUserSockets(userId, payload);
+}
+
+function finishCall(callId, type = 'call_end', extra = {}) {
+  const call = removeActiveCall(callId);
+  if (!call) return;
+  const caller = users.get(call.fromId);
+  const callee = users.get(call.toId);
+  const payloadForCaller = {
+    type,
+    callId: call.id,
+    publicCode: callee?.publicCode || '',
+    from: callee?.publicCode || '',
+    to: caller?.publicCode || '',
+    video: !!call.video,
+    timestamp: Date.now(),
+    ...extra
+  };
+  const payloadForCallee = {
+    type,
+    callId: call.id,
+    publicCode: caller?.publicCode || '',
+    from: caller?.publicCode || '',
+    to: callee?.publicCode || '',
+    video: !!call.video,
+    timestamp: Date.now(),
+    ...extra
+  };
+  sendCallPayload(call.fromId, payloadForCaller);
+  sendCallPayload(call.toId, payloadForCallee);
+}
 
 function getUserSockets(userId) {
   return wsClients.get(userId) || new Set();
@@ -1136,6 +1198,19 @@ wss.on('connection', (ws) => {
         if (!isValidPublicCode(toCode)) { ws.send(JSON.stringify({ type: 'error', error: 'Invalid recipient' })); return; }
         const toId = pubcodes.get(toCode);
         if (!toId || !users.has(toId)) { ws.send(JSON.stringify({ type: 'error', error: 'User not found' })); return; }
+        const callerBusy = getCallByUser(userId);
+        const calleeBusy = getCallByUser(toId);
+        if (callerBusy || calleeBusy) {
+          ws.send(JSON.stringify({
+            type: 'call_busy',
+            callId: String(msg.callId || ''),
+            publicCode: toCode,
+            to: toCode,
+            video: !!msg.video,
+            timestamp: Date.now()
+          }));
+          return;
+        }
         const recipientOnline = hasOnlineSocket(toId);
         const hasPushTarget = (deviceTokens.get(toId)?.size || 0) > 0;
         if (!recipientOnline && !hasPushTarget) {
@@ -1143,8 +1218,21 @@ wss.on('connection', (ws) => {
           return;
         }
         const senderUser = users.get(userId);
+        const callId = String(msg.callId || crypto.randomUUID());
+        const timeoutHandle = setTimeout(() => {
+          finishCall(callId, 'call_timeout', { reason: 'timeout' });
+        }, 30000);
+        activeCalls.set(callId, {
+          id: callId,
+          fromId: userId,
+          toId,
+          video: !!msg.video,
+          answered: false,
+          timeoutHandle
+        });
         sendToUserSockets(toId, {
           type: 'incoming_call',
+          callId,
           from: senderUser.publicCode,
           publicCode: senderUser.publicCode,
           fromName: senderUser.displayName || '',
@@ -1156,6 +1244,7 @@ wss.on('connection', (ws) => {
         });
         ws.send(JSON.stringify({
           type: 'call_ringing',
+          callId,
           to: toCode,
           publicCode: toCode,
           video: !!msg.video,
@@ -1164,6 +1253,7 @@ wss.on('connection', (ws) => {
         await sendPushToUser(toId, {
           data: {
             type: 'incoming_call',
+            callId,
             publicCode: senderUser.publicCode,
             displayName: senderUser.displayName || '',
             fromName: senderUser.displayName || '',
@@ -1181,12 +1271,75 @@ wss.on('connection', (ws) => {
             }
           }
         });
-        ws.send(JSON.stringify({
-          type: 'call_ringing',
-          to: toCode,
+        break;
+      }
+
+      case 'webrtc_offer': {
+        if (!userId) return;
+        const toCode = String(msg.to || '').toUpperCase();
+        const sdp = typeof msg.sdp === 'string' ? msg.sdp : '';
+        const callId = String(msg.callId || '');
+        if (!isValidPublicCode(toCode) || !sdp || !callId) return;
+        const toId = pubcodes.get(toCode);
+        const call = getCallById(callId);
+        if (!toId || !call) return;
+        if (![call.fromId, call.toId].includes(userId) || ![call.fromId, call.toId].includes(toId)) return;
+        sendToUserSockets(toId, {
+          type: 'webrtc_offer',
+          callId,
+          from: users.get(userId)?.publicCode || '',
+          publicCode: users.get(userId)?.publicCode || '',
+          sdp,
           video: !!msg.video,
           timestamp: Date.now()
-        }));
+        });
+        break;
+      }
+
+      case 'webrtc_answer': {
+        if (!userId) return;
+        const toCode = String(msg.to || '').toUpperCase();
+        const sdp = typeof msg.sdp === 'string' ? msg.sdp : '';
+        const callId = String(msg.callId || '');
+        if (!isValidPublicCode(toCode) || !sdp || !callId) return;
+        const toId = pubcodes.get(toCode);
+        const call = getCallById(callId);
+        if (!toId || !call) return;
+        if (![call.fromId, call.toId].includes(userId) || ![call.fromId, call.toId].includes(toId)) return;
+        sendToUserSockets(toId, {
+          type: 'webrtc_answer',
+          callId,
+          from: users.get(userId)?.publicCode || '',
+          publicCode: users.get(userId)?.publicCode || '',
+          sdp,
+          video: !!msg.video,
+          timestamp: Date.now()
+        });
+        break;
+      }
+
+      case 'ice_candidate': {
+        if (!userId) return;
+        const toCode = String(msg.to || '').toUpperCase();
+        const candidate = typeof msg.candidate === 'string' ? msg.candidate : '';
+        const callId = String(msg.callId || '');
+        const sdpMLineIndex = Number(msg.sdpMLineIndex);
+        const sdpMid = typeof msg.sdpMid === 'string' ? msg.sdpMid : null;
+        if (!isValidPublicCode(toCode) || !candidate || !callId || Number.isNaN(sdpMLineIndex)) return;
+        const toId = pubcodes.get(toCode);
+        const call = getCallById(callId);
+        if (!toId || !call) return;
+        if (![call.fromId, call.toId].includes(userId) || ![call.fromId, call.toId].includes(toId)) return;
+        sendToUserSockets(toId, {
+          type: 'ice_candidate',
+          callId,
+          from: users.get(userId)?.publicCode || '',
+          publicCode: users.get(userId)?.publicCode || '',
+          candidate,
+          sdpMid,
+          sdpMLineIndex,
+          timestamp: Date.now()
+        });
         break;
       }
 
@@ -1195,9 +1348,16 @@ wss.on('connection', (ws) => {
         const toCode = String(msg.to || '').toUpperCase();
         if (!isValidPublicCode(toCode)) return;
         const toId = pubcodes.get(toCode);
+        const callId = String(msg.callId || '');
+        const call = getCallById(callId) || getCallByUser(userId);
+        if (call) {
+          clearCallTimeout(call);
+          call.answered = true;
+        }
         if (toId) {
           sendToUserSockets(toId, {
             type: 'call_answer',
+            callId: call?.id || callId,
             from: users.get(userId)?.publicCode || '',
             publicCode: users.get(userId)?.publicCode || '',
             video: !!msg.video,
@@ -1210,11 +1370,18 @@ wss.on('connection', (ws) => {
       case 'call_end': {
         if (!userId) return;
         const toCode = String(msg.to || '').toUpperCase();
+        const callId = String(msg.callId || '');
+        const call = getCallById(callId) || getCallByUser(userId);
+        if (call) {
+          finishCall(call.id, 'call_end');
+          break;
+        }
         if (!isValidPublicCode(toCode)) return;
         const toId = pubcodes.get(toCode);
         if (toId) {
           sendToUserSockets(toId, {
             type: 'call_end',
+            callId,
             from: users.get(userId)?.publicCode || '',
             publicCode: users.get(userId)?.publicCode || '',
             video: !!msg.video,
@@ -1232,11 +1399,15 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     if (userId && !removeUserSocket(userId, ws)) {
+      const activeCall = getCallByUser(userId);
+      if (activeCall) finishCall(activeCall.id, 'call_cancelled', { reason: 'disconnect' });
       broadcastOnlineStatus(userId, false);
     }
   });
   ws.on('error', () => {
     if (userId && !removeUserSocket(userId, ws)) {
+      const activeCall = getCallByUser(userId);
+      if (activeCall) finishCall(activeCall.id, 'call_cancelled', { reason: 'disconnect' });
       broadcastOnlineStatus(userId, false);
     }
   });
