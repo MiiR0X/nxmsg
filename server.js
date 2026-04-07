@@ -1362,10 +1362,7 @@ wss.on('connection', (ws) => {
           android: {
             priority: 'high',
             ttl: 60 * 60 * 1000,
-            notification: {
-              channelId: 'nxmsg_messages',
-              sound: 'default'
-            }
+            directBootOk: true
           }
         });
 
@@ -1477,10 +1474,7 @@ wss.on('connection', (ws) => {
               android: {
                 priority: 'high',
                 ttl: 60 * 60 * 1000,
-                notification: {
-                  channelId: 'nxmsg_messages',
-                  sound: 'default'
-                }
+                directBootOk: true
               }
             });
           }
@@ -1564,10 +1558,7 @@ wss.on('connection', (ws) => {
           android: {
             priority: 'high',
             ttl: 60 * 60 * 1000,
-            notification: {
-              channelId: 'nxmsg_messages',
-              sound: 'default'
-            }
+            directBootOk: true
           }
         });
         ws.send(JSON.stringify({
