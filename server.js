@@ -59,6 +59,19 @@ app.get('/health', (req, res) => {
   });
 });
 
+function getRtcConfig() {
+  return {
+    stunUrl: process.env.NXMSG_STUN_URL || process.env.STUN_URL || 'stun:stun.l.google.com:19302',
+    turnUrl: process.env.NXMSG_TURN_URL || process.env.TURN_URL || '',
+    turnUsername: process.env.NXMSG_TURN_USERNAME || process.env.TURN_USERNAME || '',
+    turnPassword: process.env.NXMSG_TURN_PASSWORD || process.env.TURN_PASSWORD || ''
+  };
+}
+
+app.get('/api/rtc-config', (req, res) => {
+  res.json(getRtcConfig());
+});
+
 // ─── DATABASE (PostgreSQL) ──────────────────────────────
 const { Pool } = require('pg');
 
@@ -77,6 +90,8 @@ const pool = process.env.DATABASE_URL ? new Pool({
 // messages : convKey -> [{ id, from, to, encrypted, timestamp, kind, fileName, fileSize, fileType, fileData }]
 const users    = new Map();
 const pubcodes = new Map();
+const groups   = new Map();
+const groupCodes = new Map();
 const messages = new Map();
 const wsClients = new Map();
 const sessions = new Map();
@@ -194,6 +209,118 @@ function removeDeviceToken(userId, token) {
   if (!tokens.size) deviceTokens.delete(userId);
 }
 
+function generateGroupId() {
+  return `grp_${crypto.randomUUID()}`;
+}
+
+function generateUniqueShareCode() {
+  let code;
+  do { code = generatePublicCode(); } while (pubcodes.has(code) || groupCodes.has(code));
+  return code;
+}
+
+function getGroupByCode(code) {
+  const groupId = groupCodes.get(code);
+  return groupId ? groups.get(groupId) || null : null;
+}
+
+function getGroupConvKey(groupId) {
+  return `group::${groupId}`;
+}
+
+function getGroupConversationSecret(groupId) {
+  return crypto.createHmac('sha256', 'nxmsg-group-secret-2024').update(groupId).digest('hex');
+}
+
+function serializeGroupMember(userId) {
+  const user = users.get(userId);
+  if (!user) return null;
+  return JSON.stringify({
+    name: user.displayName || user.username || 'Participant',
+    username: user.username || '',
+    code: user.publicCode
+  });
+}
+
+function serializeGroupMembers(group) {
+  return Array.from(group.members || [])
+    .map(serializeGroupMember)
+    .filter(Boolean);
+}
+
+function participantCountLabel(count) {
+  const safeCount = Math.max(1, Number(count) || 1);
+  return `${safeCount} ${safeCount === 1 ? 'participant' : 'participants'}`;
+}
+
+function saveGroupToMemory(group) {
+  groups.set(group.id, group);
+  groupCodes.set(group.publicCode, group.id);
+}
+
+function buildGroupContact(group, viewerUserId) {
+  const convKey = getGroupConvKey(group.id);
+  const items = messages.get(convKey) || [];
+  const lastMsg = items.length ? items[items.length - 1] : null;
+  const secret = getGroupConversationSecret(group.id);
+  const lastText = !lastMsg
+    ? ''
+    : lastMsg.kind === 'file'
+      ? buildFilePreview(lastMsg.fileName)
+      : (decryptMessage(lastMsg.encrypted, secret) || '');
+  const senderUser = lastMsg ? users.get(lastMsg.from) : null;
+  return {
+    publicCode: group.publicCode,
+    displayName: group.name,
+    username: '',
+    bio: participantCountLabel((group.members || new Set()).size),
+    avatar: group.avatar || null,
+    online: false,
+    isGroup: true,
+    members: serializeGroupMembers(group),
+    lastTimestamp: lastMsg ? lastMsg.timestamp : group.createdAt,
+    lastText,
+    lastFrom: senderUser?.publicCode || ''
+  };
+}
+
+function buildGroupSocketMeta(group) {
+  return {
+    isGroup: true,
+    groupCode: group.publicCode,
+    publicCode: group.publicCode,
+    displayName: group.name,
+    bio: participantCountLabel((group.members || new Set()).size),
+    members: serializeGroupMembers(group)
+  };
+}
+
+async function saveGroup(group) {
+  saveGroupToMemory(group);
+  if (!pool) return;
+  try {
+    await pool.query(`
+      INSERT INTO groups (id, public_code, name, owner_id, avatar, created_at)
+      VALUES ($1,$2,$3,$4,$5,$6)
+      ON CONFLICT (id) DO UPDATE SET
+        public_code = EXCLUDED.public_code,
+        name = EXCLUDED.name,
+        owner_id = EXCLUDED.owner_id,
+        avatar = EXCLUDED.avatar
+    `, [group.id, group.publicCode, group.name, group.ownerId, group.avatar || null, group.createdAt]);
+    await pool.query('DELETE FROM group_members WHERE group_id=$1', [group.id]);
+    for (const memberId of group.members || []) {
+      await pool.query(`
+        INSERT INTO group_members (group_id, user_id)
+        VALUES ($1, $2)
+        ON CONFLICT (group_id, user_id) DO NOTHING
+      `, [group.id, memberId]);
+    }
+  } catch (e) {
+    console.error('saveGroup DB error:', e.message);
+  }
+}
+
 // ── Schema init ──────────────────────────────────────────
 async function initDB() {
   if (!pool) { console.log('⚠️  No DATABASE_URL — running with in-memory storage only'); return; }
@@ -236,6 +363,19 @@ async function initDB() {
       platform TEXT NOT NULL DEFAULT 'android',
       updated_at BIGINT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS groups (
+      id TEXT PRIMARY KEY,
+      public_code TEXT UNIQUE NOT NULL,
+      name TEXT NOT NULL,
+      owner_id TEXT NOT NULL,
+      avatar TEXT,
+      created_at BIGINT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS group_members (
+      group_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      PRIMARY KEY (group_id, user_id)
+    );
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'text';
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_name TEXT;
     ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_size BIGINT;
@@ -250,6 +390,8 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS messages_conv_key ON messages(conv_key, ts);
     CREATE INDEX IF NOT EXISTS sessions_user_id ON sessions(user_id);
     CREATE INDEX IF NOT EXISTS device_tokens_user_id ON device_tokens(user_id);
+    CREATE INDEX IF NOT EXISTS group_members_group_id ON group_members(group_id);
+    CREATE INDEX IF NOT EXISTS group_members_user_id ON group_members(user_id);
   `);
 }
 
@@ -279,6 +421,23 @@ async function loadFromDB() {
   for (const r of dRows) {
     upsertDeviceToken(r.user_id, r.token);
   }
+  const { rows: gRows } = await pool.query('SELECT * FROM groups');
+  for (const r of gRows) {
+    saveGroupToMemory({
+      id: r.id,
+      publicCode: r.public_code,
+      name: r.name,
+      ownerId: r.owner_id,
+      avatar: r.avatar || null,
+      createdAt: Number(r.created_at),
+      members: new Set()
+    });
+  }
+  const { rows: gmRows } = await pool.query('SELECT group_id, user_id FROM group_members');
+  for (const r of gmRows) {
+    const group = groups.get(r.group_id);
+    if (group) group.members.add(r.user_id);
+  }
   const { rows: mRows } = await pool.query(`
     SELECT id, conv_key, from_id, to_id, encrypted, ts, kind, file_name, file_size, file_type, file_data, reply_to_id, reply_text, reply_sender, forwarded_from
     FROM messages
@@ -304,7 +463,7 @@ async function loadFromDB() {
       forwardedFrom: r.forwarded_from || ''
     });
   }
-  console.log(`✅ Loaded ${users.size} users, ${messages.size} conversations, ${sessions.size} sessions and ${dRows.length} push tokens from DB`);
+  console.log(`✅ Loaded ${users.size} users, ${groups.size} groups, ${messages.size} conversations, ${sessions.size} sessions and ${dRows.length} push tokens from DB`);
 }
 
 // ── Persist helpers (write-through: update cache then DB) ─
@@ -613,6 +772,19 @@ function resolveSession(token) {
   return s.userId;
 }
 
+function resolveUserByCodeOrUsername(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const publicCode = trimmed.toUpperCase();
+  if (isValidPublicCode(publicCode) && pubcodes.has(publicCode)) {
+    return pubcodes.get(publicCode);
+  }
+  const username = sanitizeUsername(trimmed);
+  if (!username) return null;
+  return Array.from(users.values()).find(entry => (entry.username || '').toLowerCase() === username)?.id || null;
+}
+
 function getFirebaseServiceAccount() {
   const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
   const base64Json = process.env.FIREBASE_SERVICE_ACCOUNT_JSON_BASE64;
@@ -878,6 +1050,70 @@ app.post('/api/push/unregister', async (req, res) => {
   res.json({ ok: true });
 });
 
+app.post('/api/groups/create', async (req, res) => {
+  const userId = resolveSession(req.body.token);
+  if (!userId || !users.has(userId)) return res.status(401).json({ error: 'Unauthorized' });
+
+  const name = sanitizeDisplayName(req.body.name || '') || 'New group';
+  const rawMembers = Array.isArray(req.body.members) ? req.body.members : [];
+  const memberIds = new Set([userId]);
+  rawMembers.forEach(entry => {
+    const resolved = resolveUserByCodeOrUsername(entry);
+    if (resolved && users.has(resolved)) memberIds.add(resolved);
+  });
+
+  const group = {
+    id: generateGroupId(),
+    publicCode: generateUniqueShareCode(),
+    name,
+    ownerId: userId,
+    avatar: null,
+    createdAt: Date.now(),
+    members: memberIds
+  };
+  await saveGroup(group);
+
+  const groupContact = buildGroupContact(group, userId);
+  const payload = {
+    type: 'group_added',
+    ...buildGroupSocketMeta(group)
+  };
+  for (const memberId of group.members) {
+    if (memberId !== userId) {
+      sendToUserSockets(memberId, payload);
+    }
+  }
+
+  res.json(groupContact);
+});
+
+app.post('/api/groups/add-member', async (req, res) => {
+  const userId = resolveSession(req.body.token);
+  if (!userId || !users.has(userId)) return res.status(401).json({ error: 'Unauthorized' });
+
+  const groupCode = typeof req.body.groupCode === 'string' ? req.body.groupCode.trim().toUpperCase() : '';
+  const group = getGroupByCode(groupCode);
+  if (!group) return res.status(404).json({ error: 'Group not found' });
+  if (!group.members.has(userId)) return res.status(403).json({ error: 'Not a group member' });
+
+  const memberId = resolveUserByCodeOrUsername(req.body.member || req.body.memberCode || req.body.username || '');
+  if (!memberId || !users.has(memberId)) return res.status(404).json({ error: 'User not found' });
+  if (group.members.has(memberId)) return res.status(409).json({ error: 'User already in the group' });
+
+  group.members.add(memberId);
+  await saveGroup(group);
+
+  const updatePayload = {
+    type: 'group_updated',
+    ...buildGroupSocketMeta(group)
+  };
+  for (const existingMemberId of group.members) {
+    sendToUserSockets(existingMemberId, updatePayload);
+  }
+
+  res.json(buildGroupContact(group, userId));
+});
+
 // Get contacts for current user
 app.post('/api/contacts', (req, res) => {
   const userId = resolveSession(req.body.token);
@@ -904,11 +1140,17 @@ app.post('/api/contacts', (req, res) => {
       bio: cu.bio || '',
       avatar: cu.avatar || null,
       online: hasOnlineSocket(contactId),
+      isGroup: false,
+      members: [],
       lastTimestamp: lastMsg ? lastMsg.timestamp : 0,
       lastText,
-      lastFrom: lastMsg ? (lastMsg.from === userId ? 'me' : 'them') : null,
+      lastFrom: lastMsg ? (users.get(lastMsg.from)?.publicCode || '') : '',
       messageCount: msgs.length
     });
+  }
+  for (const group of groups.values()) {
+    if (!group.members.has(userId)) continue;
+    contacts.push(buildGroupContact(group, userId));
   }
   contacts.sort((a, b) => b.lastTimestamp - a.lastTimestamp);
   res.json(contacts);
@@ -921,6 +1163,15 @@ app.post('/api/messages', (req, res) => {
 
   const { contactCode } = req.body;
   if (!isValidPublicCode(contactCode)) return res.status(400).json({ error: 'Invalid code' });
+  const group = getGroupByCode(contactCode);
+  if (group) {
+    if (!group.members.has(userId)) return res.status(403).json({ error: 'Access denied' });
+    const key = getGroupConvKey(group.id);
+    const secret = getGroupConversationSecret(group.id);
+    const raw = messages.get(key) || [];
+    const decrypted = raw.map(m => serializeMessageForClient(m, userId, secret));
+    return res.json(decrypted);
+  }
   const contactId = pubcodes.get(contactCode);
   if (!contactId || !users.has(contactId)) return res.status(404).json({ error: 'Contact not found' });
 
@@ -963,8 +1214,6 @@ wss.on('connection', (ws) => {
         const { to: toCode, text } = msg; // 'to' is recipient's PUBLIC CODE
 
         if (!isValidPublicCode(toCode)) { ws.send(JSON.stringify({ type: 'error', error: 'Invalid recipient' })); return; }
-        const toId = pubcodes.get(toCode);
-        if (!toId || !users.has(toId)) { ws.send(JSON.stringify({ type: 'error', error: 'User not found' })); return; }
         if (typeof text !== 'string' || !text.trim()) { ws.send(JSON.stringify({ type: 'error', error: 'Empty message' })); return; }
 
         const safeText = sanitizeText(text.trim());
@@ -972,6 +1221,92 @@ wss.on('connection', (ws) => {
         const replyText = typeof msg.replyText === 'string' ? sanitizeText(msg.replyText.trim()).slice(0, 500) : '';
         const replySender = typeof msg.replySender === 'string' ? sanitizeDisplayName(msg.replySender) : '';
         const forwardedFrom = typeof msg.forwardedFrom === 'string' ? sanitizeDisplayName(msg.forwardedFrom) : '';
+        const senderUser = users.get(userId);
+        const group = getGroupByCode(toCode);
+        if (group) {
+          if (!group.members.has(userId)) {
+            ws.send(JSON.stringify({ type: 'error', error: 'Access denied' }));
+            return;
+          }
+          const secret = getGroupConversationSecret(group.id);
+          const timestamp = Date.now();
+          const msgObj = {
+            id: crypto.randomUUID(),
+            from: userId,
+            to: group.id,
+            encrypted: encryptMessage(safeText, secret),
+            timestamp,
+            kind: 'text',
+            fileName: '',
+            fileSize: 0,
+            fileType: '',
+            fileData: '',
+            replyToId,
+            replyText,
+            replySender,
+            forwardedFrom
+          };
+          const convKey = getGroupConvKey(group.id);
+          await saveMessage(convKey, msgObj);
+
+          const socketPayload = {
+            type: 'new_message',
+            ...buildGroupSocketMeta(group),
+            id: msgObj.id,
+            from: senderUser.publicCode,
+            fromName: senderUser.displayName || '',
+            username: senderUser.username || '',
+            avatar: senderUser.avatar || null,
+            text: safeText,
+            timestamp,
+            replyToId,
+            replyText,
+            replySender,
+            forwardedFrom
+          };
+          for (const memberId of group.members) {
+            if (memberId === userId) continue;
+            sendToUserSockets(memberId, socketPayload);
+            await sendPushToUser(memberId, {
+              data: {
+                type: 'incoming_message',
+                publicCode: group.publicCode,
+                displayName: group.name,
+                fromName: senderUser.displayName || '',
+                username: '',
+                avatar: group.avatar || '',
+                text: safeText,
+                timestamp: String(timestamp),
+                isGroup: 'true'
+              },
+              android: {
+                priority: 'high',
+                ttl: 60 * 60 * 1000,
+                notification: {
+                  channelId: 'nxmsg_messages',
+                  sound: 'default'
+                }
+              }
+            });
+          }
+
+          ws.send(JSON.stringify({
+            type: 'message_sent',
+            ...buildGroupSocketMeta(group),
+            id: msgObj.id,
+            to: toCode,
+            text: safeText,
+            timestamp,
+            replyToId,
+            replyText,
+            replySender,
+            forwardedFrom
+          }));
+          break;
+        }
+
+        const toId = pubcodes.get(toCode);
+        if (!toId || !users.has(toId)) { ws.send(JSON.stringify({ type: 'error', error: 'User not found' })); return; }
         const secret = getConversationSecret(userId, toId);
         const encrypted = encryptMessage(safeText, secret);
 
@@ -995,7 +1330,6 @@ wss.on('connection', (ws) => {
         const isFirst = !messages.has(convKey) || !messages.get(convKey).length;
         await saveMessage(convKey, msgObj);
 
-        const senderUser = users.get(userId);
         if (isFirst) {
           sendToUserSockets(toId, buildChatStartedPayload(senderUser));
         }
@@ -1066,8 +1400,6 @@ wss.on('connection', (ws) => {
         if (!userId) { ws.send(JSON.stringify({ type:'error', error:'Not authenticated' })); return; }
         const { to: toCode, fileName, fileSize, fileType, data } = msg;
         if (!isValidPublicCode(toCode)) return;
-        const toId = pubcodes.get(toCode);
-        if (!toId || !users.has(toId)) { ws.send(JSON.stringify({ type:'error', error:'User not found' })); return; }
         // Validate file data
         if (typeof data !== 'string' || !data.startsWith('data:')) { ws.send(JSON.stringify({ type:'error', error:'Invalid file data' })); return; }
         if (data.length > 28 * 1024 * 1024) { ws.send(JSON.stringify({ type:'error', error:'File too large (max 20 MB)' })); return; }
@@ -1081,6 +1413,98 @@ wss.on('connection', (ws) => {
         const fileSender = users.get(userId);
         const fileId = crypto.randomUUID();
         const ts = Date.now();
+        const group = getGroupByCode(toCode);
+        if (group) {
+          if (!group.members.has(userId)) {
+            ws.send(JSON.stringify({ type:'error', error:'Access denied' }));
+            return;
+          }
+          const secret = getGroupConversationSecret(group.id);
+          const encrypted = encryptMessage(buildFilePreview(safeName), secret);
+          const msgObj = {
+            id: fileId,
+            from: userId,
+            to: group.id,
+            encrypted,
+            timestamp: ts,
+            kind: 'file',
+            fileName: safeName,
+            fileSize: safeSize,
+            fileType: safeType,
+            fileData: data,
+            replyToId,
+            replyText,
+            replySender,
+            forwardedFrom
+          };
+          const convKey = getGroupConvKey(group.id);
+          await saveMessage(convKey, msgObj);
+          const socketPayload = {
+            type:'new_file',
+            ...buildGroupSocketMeta(group),
+            id:fileId,
+            from:fileSender.publicCode,
+            fromName:fileSender.displayName||'',
+            username:fileSender.username||'',
+            avatar:fileSender.avatar||null,
+            fileName:safeName,
+            fileSize:safeSize,
+            fileType:safeType,
+            fileData:data,
+            data,
+            timestamp:ts,
+            replyToId,
+            replyText,
+            replySender,
+            forwardedFrom
+          };
+          for (const memberId of group.members) {
+            if (memberId === userId) continue;
+            sendToUserSockets(memberId, socketPayload);
+            await sendPushToUser(memberId, {
+              data: {
+                type: 'incoming_message',
+                publicCode: group.publicCode,
+                displayName: group.name,
+                fromName: fileSender.displayName || '',
+                username: '',
+                avatar: group.avatar || '',
+                fileName: safeName,
+                text: buildFilePreview(safeName),
+                timestamp: String(ts),
+                isGroup: 'true'
+              },
+              android: {
+                priority: 'high',
+                ttl: 60 * 60 * 1000,
+                notification: {
+                  channelId: 'nxmsg_messages',
+                  sound: 'default'
+                }
+              }
+            });
+          }
+          ws.send(JSON.stringify({
+            type:'file_sent',
+            ...buildGroupSocketMeta(group),
+            id:fileId,
+            to:toCode,
+            fileName:safeName,
+            fileSize:safeSize,
+            fileType:safeType,
+            fileData:data,
+            data,
+            timestamp:ts,
+            replyToId,
+            replyText,
+            replySender,
+            forwardedFrom
+          }));
+          break;
+        }
+
+        const toId = pubcodes.get(toCode);
+        if (!toId || !users.has(toId)) { ws.send(JSON.stringify({ type:'error', error:'User not found' })); return; }
         const secret = getConversationSecret(userId, toId);
         const encrypted = encryptMessage(buildFilePreview(safeName), secret);
         const msgObj = {
@@ -1169,6 +1593,31 @@ wss.on('connection', (ws) => {
         const toCode = String(msg.to || '').toUpperCase();
         const messageId = typeof msg.messageId === 'string' ? msg.messageId.trim() : '';
         if (!isValidPublicCode(toCode) || !messageId) return;
+        const group = getGroupByCode(toCode);
+        if (group) {
+          if (!group.members.has(userId)) return;
+          const convKey = getGroupConvKey(group.id);
+          const convMessages = messages.get(convKey) || [];
+          const targetMessage = convMessages.find(entry => entry.id === messageId);
+          if (!targetMessage || targetMessage.from !== userId) {
+            ws.send(JSON.stringify({ type: 'error', error: 'Cannot delete this message' }));
+            return;
+          }
+          await deleteMessageRecord(convKey, messageId);
+          const payload = {
+            type: 'message_deleted',
+            ...buildGroupSocketMeta(group),
+            id: messageId,
+            from: users.get(userId)?.publicCode || '',
+            to: toCode,
+            timestamp: Date.now()
+          };
+          for (const memberId of group.members) {
+            sendToUserSockets(memberId, payload);
+          }
+          ws.send(JSON.stringify(payload));
+          break;
+        }
         const toId = pubcodes.get(toCode);
         if (!toId || !users.has(toId)) return;
         const convKey = getConvKey(userId, toId);
