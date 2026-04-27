@@ -11,8 +11,6 @@
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>NXMSG — Secure Messenger</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Google+Sans+Text:wght@400;500&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <style>
 /* ════════════════════════════════════════════════════════
    NXMSG — Material Design 3 · Dark Theme · Orange Accent
@@ -45,9 +43,9 @@
   --md-online:             #22cc66;
 
   /* ── type scale ── */
-  --md-brand: 'Google Sans', sans-serif;
-  --md-plain: 'Google Sans Text', sans-serif;
-  --md-mono:  'Space Mono', monospace;
+  --md-brand: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  --md-plain: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  --md-mono:  Consolas, "SFMono-Regular", Menlo, monospace;
 
   /* ── elevation overlays (dark surfaces use tinted overlays) ── */
   --md-elev1: rgba(255,109,46,0.05);
@@ -924,7 +922,7 @@ body {
   <div class="auth-box">
     <div class="auth-title">Вход</div>
     <div class="auth-error" id="login-error"></div>
-    <input type="text" id="login-code" class="input" placeholder="Ваш код (12 символов, напр. ABCD1234EFGH)" maxlength="12" autocomplete="off" spellcheck="false" style="text-transform:uppercase;letter-spacing:2px;">
+    <input type="text" id="login-code" class="input" placeholder="Ваш код или @username" maxlength="32" autocomplete="off" spellcheck="false">
     <input type="password" id="login-pass" class="input" placeholder="Пароль" maxlength="128" autocomplete="current-password">
     <button class="btn btn-primary" id="login-btn" onclick="doLogin()">Войти</button>
     <button class="btn btn-ghost" onclick="showScreen('screen-welcome')">← Назад</button>
@@ -997,7 +995,7 @@ body {
 <div class="modal-overlay" id="modal-new-chat">
   <div class="modal">
     <div class="modal-title">Новый чат <button class="modal-close" onclick="closeModal('modal-new-chat')">✕</button></div>
-    <input type="text" id="new-chat-input" class="input" placeholder="Код собеседника (12 символов)..." maxlength="12" autocomplete="off" spellcheck="false" style="text-transform:uppercase;letter-spacing:2px;">
+    <input type="text" id="new-chat-input" class="input" placeholder="Код собеседника или @username" maxlength="32" autocomplete="off" spellcheck="false">
     <div class="input-hint">// Введите 12-символьный код или отсканируйте QR</div>
     <button class="btn btn-primary" onclick="startNewChat()">Начать чат</button>
     <button class="btn btn-ghost" onclick="showScanModal()">▣ Сканировать QR</button>
@@ -1043,7 +1041,7 @@ body {
       <div class="setting-label">Ваш публичный код</div>
       <div style="display:flex;align-items:center;gap:8px;">
         <span class="input" id="settings-code-display" style="flex:1;letter-spacing:3px;font-weight:700;color:var(--md-primary);cursor:default;user-select:all;font-family:var(--md-mono);"></span>
-        <button class="btn btn-ghost" style="padding:10px 14px;font-size:13px;flex-shrink:0;" onclick="copyMyCode();showToast('Код скопирован')">⧉ Копировать</button>
+        <button class="btn btn-ghost" style="padding:10px 14px;font-size:13px;flex-shrink:0;" onclick="copyMyCode()">⧉ Копировать</button>
       </div>
     </div>
     <div class="setting-row">
@@ -1099,6 +1097,7 @@ body {
 <div class="toast" id="toast"></div>
 
 <script>
+if (false) {
 // ════════════════════════════════════════════════════════
 //  NXMSG Client — DEMO MODE (offline, no server)
 // ════════════════════════════════════════════════════════
@@ -1998,6 +1997,8 @@ document.addEventListener('DOMContentLoaded', () => {
   // (можно закомментировать чтобы показывался welcome screen)
   initApp();
 });
+}
 </script>
+<script src="/app.js"></script>
 </body>
 </html>
