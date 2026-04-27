@@ -80,25 +80,6 @@ class HttpError extends Error {
   }
 }
 
-let startupError = null;
-const startupPromise = (async () => {
-  try {
-    await initDB();
-    await loadFromDB();
-    initFirebaseAdmin();
-  } catch (error) {
-    startupError = error;
-    console.error('DB init failed:', error.message);
-    console.error('Running without persistent DB (data will be lost on restart)');
-  }
-})();
-
-app.use((req, res, next) => {
-  startupPromise
-    .then(() => next())
-    .catch(next);
-});
-
 app.get('/', (req, res) => {
   res.sendFile(landingPagePath, (error) => {
     if (!error) return;
@@ -129,11 +110,24 @@ app.get('/health', (req, res) => {
 });
 
 function getRtcConfig() {
+  const stunUrls = parseIceUrls(process.env.NXMSG_STUN_URL || process.env.STUN_URL);
+  const customTurnUrls = parseIceUrls(process.env.NXMSG_TURN_URL || process.env.TURN_URL);
+  const customTurnUsername = String(process.env.NXMSG_TURN_USERNAME || process.env.TURN_USERNAME || '').trim();
+  const customTurnPassword = String(process.env.NXMSG_TURN_PASSWORD || process.env.TURN_PASSWORD || '').trim();
+  const hasCustomTurn = customTurnUrls.length > 0 && customTurnUsername && customTurnPassword;
+  const turnUrls = hasCustomTurn ? customTurnUrls : defaultFallbackTurnUrls();
+  const turnCredentials = hasCustomTurn
+    ? { username: customTurnUsername, password: customTurnPassword }
+    : buildFallbackTurnCredentials();
+
   return {
-    stunUrl: process.env.NXMSG_STUN_URL || process.env.STUN_URL || 'stun:stun.l.google.com:19302',
-    turnUrl: process.env.NXMSG_TURN_URL || process.env.TURN_URL || '',
-    turnUsername: process.env.NXMSG_TURN_USERNAME || process.env.TURN_USERNAME || '',
-    turnPassword: process.env.NXMSG_TURN_PASSWORD || process.env.TURN_PASSWORD || ''
+    stunUrls: stunUrls.length ? stunUrls : defaultStunUrls(),
+    turnUrls,
+    turnUsername: turnCredentials.username,
+    turnPassword: turnCredentials.password,
+    stunUrl: stunUrls[0] || defaultStunUrls()[0],
+    turnUrl: turnUrls[0] || '',
+    hasCustomTurn
   };
 }
 
@@ -152,6 +146,25 @@ const pool = process.env.DATABASE_URL ? new Pool({
     ? false
     : { rejectUnauthorized: false }
 }) : null;
+
+let startupError = null;
+const startupPromise = (async () => {
+  try {
+    await initDB();
+    await loadFromDB();
+    initFirebaseAdmin();
+  } catch (error) {
+    startupError = error;
+    console.error('DB init failed:', error.message);
+    console.error('Running without persistent DB (data will be lost on restart)');
+  }
+})();
+
+app.use((req, res, next) => {
+  startupPromise
+    .then(() => next())
+    .catch(next);
+});
 
 // In-memory cache (populated from DB on startup, kept in sync on writes)
 // users    : userId  -> { id, passwordHash, displayName, bio, avatar, registeredAt, publicCode, username }
@@ -820,6 +833,40 @@ function buildChatStartedPayload(senderUser) {
     avatar: senderUser.avatar || null,
     online: true
   };
+}
+
+function parseIceUrls(raw) {
+  return String(raw || '')
+    .split(/[\n\r,;]+/)
+    .map(value => value.trim())
+    .filter(Boolean);
+}
+
+function defaultStunUrls() {
+  return [
+    'stun:stun.l.google.com:19302',
+    'stun:stun1.l.google.com:19302',
+    'stun:openrelay.metered.ca:80'
+  ];
+}
+
+function defaultFallbackTurnUrls() {
+  return [
+    'turn:staticauth.openrelay.metered.ca:80',
+    'turn:staticauth.openrelay.metered.ca:443',
+    'turn:staticauth.openrelay.metered.ca:443?transport=tcp',
+    'turns:staticauth.openrelay.metered.ca:443?transport=tcp'
+  ];
+}
+
+function buildFallbackTurnCredentials() {
+  const expiry = Math.floor(Date.now() / 1000) + 3600;
+  const username = `${expiry}:nxmsg`;
+  const password = crypto
+    .createHmac('sha1', 'openrelayprojectsecret')
+    .update(username)
+    .digest('base64');
+  return { username, password };
 }
 
 function normalizeReplyMeta(source = {}) {
