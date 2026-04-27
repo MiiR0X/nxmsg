@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -1397,9 +1398,16 @@ function resolveUserByCodeOrUsername(value) {
 }
 
 function getFirebaseServiceAccount() {
+  const filePath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
   const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
   const base64Json = process.env.FIREBASE_SERVICE_ACCOUNT_JSON_BASE64;
   try {
+    if (filePath) {
+      const fs = require('fs');
+      const path = require('path');
+      const resolved = path.isAbsolute(filePath) ? filePath : path.resolve(__dirname, filePath);
+      return JSON.parse(fs.readFileSync(resolved, 'utf8'));
+    }
     if (rawJson) {
       return JSON.parse(rawJson);
     }

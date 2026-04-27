@@ -1,3 +1,5 @@
 railway-private-vars.txt
 nxmsg-android/firebase.properties
 *.adminsdk-*.json
+.env
+secrets/
