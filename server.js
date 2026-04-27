@@ -7,9 +7,29 @@ const path = require('path');
 const fs = require('fs');
 const admin = require('firebase-admin');
 
+function readBooleanEnv(name, fallback = false) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(String(raw).trim().toLowerCase());
+}
+
+function readIntegerEnv(name, fallback, minValue = 1) {
+  const raw = Number.parseInt(process.env[name] || '', 10);
+  if (Number.isNaN(raw)) return fallback;
+  return Math.max(minValue, raw);
+}
+
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const runningOnRender = readBooleanEnv('RENDER', false);
+const websocketEnabled = process.env.NXMSG_DISABLE_WS !== 'true';
+const renderKeepaliveEnabled = readBooleanEnv('NXMSG_RENDER_KEEPALIVE_ENABLED', runningOnRender);
+const renderKeepaliveIntervalMs = readIntegerEnv('NXMSG_KEEPALIVE_INTERVAL_MS', 5 * 60 * 1000, 60 * 1000);
+const renderKeepaliveStartupDelayMs = readIntegerEnv('NXMSG_KEEPALIVE_STARTUP_DELAY_MS', 45 * 1000, 5 * 1000);
+const renderKeepaliveTimeoutMs = readIntegerEnv('NXMSG_KEEPALIVE_TIMEOUT_MS', 15 * 1000, 1000);
+const wss = websocketEnabled ? new WebSocket.Server({ server }) : null;
+const publicDir = path.join(__dirname, 'public');
+const landingPagePath = path.join(publicDir, 'index.html');
 
 app.use(express.json({ limit: '35mb' }));
 
@@ -39,8 +59,6 @@ app.get('/apple-touch-icon.png', (req, res) => {
   res.send(ICON_SVG(180));
 });
 
-app.use(express.static(path.join(__dirname, 'public')));
-
 app.use((req, res, next) => {
   res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' ws: wss:");
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -49,9 +67,60 @@ app.use((req, res, next) => {
   next();
 });
 
+app.use((req, res, next) => {
+  const remoteAddress = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  console.log(`[HTTP] ${req.method} ${req.originalUrl} from ${remoteAddress}`);
+  next();
+});
+
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+let startupError = null;
+const startupPromise = (async () => {
+  try {
+    await initDB();
+    await loadFromDB();
+    initFirebaseAdmin();
+  } catch (error) {
+    startupError = error;
+    console.error('DB init failed:', error.message);
+    console.error('Running without persistent DB (data will be lost on restart)');
+  }
+})();
+
+app.use((req, res, next) => {
+  startupPromise
+    .then(() => next())
+    .catch(next);
+});
+
+app.get('/', (req, res) => {
+  res.sendFile(landingPagePath, (error) => {
+    if (!error) return;
+    console.error('Failed to send landing page:', error.message);
+    if (!res.headersSent) {
+      res.status(500).type('text/plain').send('NXMSG server is running, but the landing page could not be loaded.');
+    }
+  });
+});
+
+app.use(express.static(publicDir));
+
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
+    service: 'nxmsg',
+    platform: runningOnRender ? 'render' : 'generic',
+    realtime: websocketEnabled ? 'websocket' : 'http-only',
+    keepalive: {
+      enabled: renderKeepaliveEnabled,
+      intervalMs: renderKeepaliveEnabled ? renderKeepaliveIntervalMs : 0
+    },
     uptime: process.uptime(),
     users: users.size,
     conversations: messages.size,
@@ -75,8 +144,8 @@ app.get('/api/rtc-config', (req, res) => {
 // ─── DATABASE (PostgreSQL) ──────────────────────────────
 const { Pool } = require('pg');
 
-// DATABASE_URL is set automatically by Railway when you attach a PostgreSQL database.
-// For local dev, set it in .env or environment: DATABASE_URL=postgresql://user:pass@host/db
+// Set DATABASE_URL in the hosting platform environment.
+// For local dev, use something like: DATABASE_URL=postgresql://user:pass@host/db
 const pool = process.env.DATABASE_URL ? new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: /localhost|127\.0\.0\.1/i.test(process.env.DATABASE_URL)
@@ -716,7 +785,7 @@ function ensureUniqueUsername(preferred, displayName, publicCode, exceptUserId =
 }
 
 function buildFilePreview(fileName) {
-  return `📎 ${fileName || 'Файл'}`;
+  return `[file] ${fileName || 'file'}`;
 }
 
 function serializeMessageForClient(message, viewerUserId, secret) {
@@ -751,6 +820,439 @@ function buildChatStartedPayload(senderUser) {
     avatar: senderUser.avatar || null,
     online: true
   };
+}
+
+function normalizeReplyMeta(source = {}) {
+  return {
+    replyToId: typeof source.replyToId === 'string' ? source.replyToId.trim().slice(0, 120) : '',
+    replyText: typeof source.replyText === 'string' ? sanitizeText(source.replyText.trim()).slice(0, 500) : '',
+    replySender: typeof source.replySender === 'string' ? sanitizeDisplayName(source.replySender) : '',
+    forwardedFrom: typeof source.forwardedFrom === 'string' ? sanitizeDisplayName(source.forwardedFrom) : ''
+  };
+}
+
+async function createTextMessage(fromUserId, toCode, text, meta = {}) {
+  if (!users.has(fromUserId)) throw new HttpError(401, 'Unauthorized');
+  const normalizedToCode = String(toCode || '').trim().toUpperCase();
+  if (!isValidPublicCode(normalizedToCode)) throw new HttpError(400, 'Invalid recipient');
+  if (typeof text !== 'string' || !text.trim()) throw new HttpError(400, 'Empty message');
+
+  const safeText = sanitizeText(text.trim());
+  const { replyToId, replyText, replySender, forwardedFrom } = normalizeReplyMeta(meta);
+  const senderUser = users.get(fromUserId);
+  const group = getGroupByCode(normalizedToCode);
+
+  if (group) {
+    if (!group.members.has(fromUserId)) throw new HttpError(403, 'Access denied');
+
+    const secret = getGroupConversationSecret(group.id);
+    const timestamp = Date.now();
+    const msgObj = {
+      id: crypto.randomUUID(),
+      from: fromUserId,
+      to: group.id,
+      encrypted: encryptMessage(safeText, secret),
+      timestamp,
+      kind: 'text',
+      fileName: '',
+      fileSize: 0,
+      fileType: '',
+      fileData: '',
+      replyToId,
+      replyText,
+      replySender,
+      forwardedFrom
+    };
+    const convKey = getGroupConvKey(group.id);
+    await saveMessage(convKey, msgObj);
+
+    const inboundPayload = {
+      type: 'new_message',
+      ...buildGroupSocketMeta(group),
+      id: msgObj.id,
+      from: senderUser.publicCode,
+      fromName: senderUser.displayName || '',
+      username: senderUser.username || '',
+      avatar: senderUser.avatar || null,
+      text: safeText,
+      timestamp,
+      replyToId,
+      replyText,
+      replySender,
+      forwardedFrom
+    };
+
+    for (const memberId of group.members) {
+      if (memberId === fromUserId) continue;
+      sendToUserSockets(memberId, inboundPayload);
+      await sendPushToUser(memberId, {
+        data: {
+          type: 'incoming_message',
+          publicCode: group.publicCode,
+          displayName: group.name,
+          fromName: senderUser.displayName || '',
+          username: '',
+          avatar: group.avatar || '',
+          text: safeText,
+          timestamp: String(timestamp),
+          isGroup: 'true'
+        },
+        android: {
+          priority: 'high',
+          ttl: 60 * 60 * 1000,
+          notification: {
+            channelId: 'nxmsg_messages',
+            sound: 'default'
+          }
+        }
+      });
+    }
+
+    return {
+      ackPayload: {
+        type: 'message_sent',
+        ...buildGroupSocketMeta(group),
+        id: msgObj.id,
+        to: normalizedToCode,
+        text: safeText,
+        timestamp,
+        replyToId,
+        replyText,
+        replySender,
+        forwardedFrom
+      },
+      message: serializeMessageForClient(msgObj, fromUserId, secret)
+    };
+  }
+
+  const toId = pubcodes.get(normalizedToCode);
+  if (!toId || !users.has(toId)) throw new HttpError(404, 'User not found');
+
+  const secret = getConversationSecret(fromUserId, toId);
+  const msgObj = {
+    id: crypto.randomUUID(),
+    from: fromUserId,
+    to: toId,
+    encrypted: encryptMessage(safeText, secret),
+    timestamp: Date.now(),
+    kind: 'text',
+    fileName: '',
+    fileSize: 0,
+    fileType: '',
+    fileData: '',
+    replyToId,
+    replyText,
+    replySender,
+    forwardedFrom
+  };
+  const convKey = getConvKey(fromUserId, toId);
+  const isFirst = !messages.has(convKey) || !messages.get(convKey).length;
+  await saveMessage(convKey, msgObj);
+
+  if (isFirst) {
+    sendToUserSockets(toId, buildChatStartedPayload(senderUser));
+  }
+  sendToUserSockets(toId, {
+    type: 'new_message',
+    id: msgObj.id,
+    from: senderUser.publicCode,
+    fromName: senderUser.displayName || '',
+    username: senderUser.username || '',
+    avatar: senderUser.avatar || null,
+    text: safeText,
+    timestamp: msgObj.timestamp,
+    replyToId,
+    replyText,
+    replySender,
+    forwardedFrom
+  });
+  await sendPushToUser(toId, {
+    data: {
+      type: 'incoming_message',
+      publicCode: senderUser.publicCode,
+      displayName: senderUser.displayName || '',
+      fromName: senderUser.displayName || '',
+      username: senderUser.username || '',
+      avatar: senderUser.avatar || '',
+      text: safeText,
+      timestamp: String(msgObj.timestamp)
+    },
+    android: {
+      priority: 'high',
+      ttl: 60 * 60 * 1000,
+      directBootOk: true
+    }
+  });
+
+  return {
+    ackPayload: {
+      type: 'message_sent',
+      id: msgObj.id,
+      to: normalizedToCode,
+      text: safeText,
+      timestamp: msgObj.timestamp,
+      replyToId,
+      replyText,
+      replySender,
+      forwardedFrom
+    },
+    message: serializeMessageForClient(msgObj, fromUserId, secret)
+  };
+}
+
+async function createFileMessage(fromUserId, toCode, fileMeta = {}) {
+  if (!users.has(fromUserId)) throw new HttpError(401, 'Unauthorized');
+  const normalizedToCode = String(toCode || '').trim().toUpperCase();
+  if (!isValidPublicCode(normalizedToCode)) throw new HttpError(400, 'Invalid recipient');
+
+  const data = fileMeta.data;
+  if (typeof data !== 'string' || !data.startsWith('data:')) {
+    throw new HttpError(400, 'Invalid file data');
+  }
+  if (data.length > 28 * 1024 * 1024) {
+    throw new HttpError(413, 'File too large (max 20 MB)');
+  }
+
+  const safeName = typeof fileMeta.fileName === 'string'
+    ? fileMeta.fileName.replace(/[<>&"']/g, '').slice(0, 255)
+    : 'file';
+  const safeSize = typeof fileMeta.fileSize === 'number' ? fileMeta.fileSize : 0;
+  const safeType = typeof fileMeta.fileType === 'string'
+    ? fileMeta.fileType.slice(0, 100)
+    : 'application/octet-stream';
+  const { replyToId, replyText, replySender, forwardedFrom } = normalizeReplyMeta(fileMeta);
+  const fileSender = users.get(fromUserId);
+  const fileId = crypto.randomUUID();
+  const timestamp = Date.now();
+  const group = getGroupByCode(normalizedToCode);
+
+  if (group) {
+    if (!group.members.has(fromUserId)) throw new HttpError(403, 'Access denied');
+
+    const secret = getGroupConversationSecret(group.id);
+    const msgObj = {
+      id: fileId,
+      from: fromUserId,
+      to: group.id,
+      encrypted: encryptMessage(buildFilePreview(safeName), secret),
+      timestamp,
+      kind: 'file',
+      fileName: safeName,
+      fileSize: safeSize,
+      fileType: safeType,
+      fileData: data,
+      replyToId,
+      replyText,
+      replySender,
+      forwardedFrom
+    };
+    const convKey = getGroupConvKey(group.id);
+    await saveMessage(convKey, msgObj);
+
+    const inboundPayload = {
+      type: 'new_file',
+      ...buildGroupSocketMeta(group),
+      id: fileId,
+      from: fileSender.publicCode,
+      fromName: fileSender.displayName || '',
+      username: fileSender.username || '',
+      avatar: fileSender.avatar || null,
+      fileName: safeName,
+      fileSize: safeSize,
+      fileType: safeType,
+      fileData: data,
+      data,
+      timestamp,
+      replyToId,
+      replyText,
+      replySender,
+      forwardedFrom
+    };
+
+    for (const memberId of group.members) {
+      if (memberId === fromUserId) continue;
+      sendToUserSockets(memberId, inboundPayload);
+      await sendPushToUser(memberId, {
+        data: {
+          type: 'incoming_message',
+          publicCode: group.publicCode,
+          displayName: group.name,
+          fromName: fileSender.displayName || '',
+          username: '',
+          avatar: group.avatar || '',
+          fileName: safeName,
+          text: buildFilePreview(safeName),
+          timestamp: String(timestamp),
+          isGroup: 'true'
+        },
+        android: {
+          priority: 'high',
+          ttl: 60 * 60 * 1000,
+          directBootOk: true
+        }
+      });
+    }
+
+    return {
+      ackPayload: {
+        type: 'file_sent',
+        ...buildGroupSocketMeta(group),
+        id: fileId,
+        to: normalizedToCode,
+        fileName: safeName,
+        fileSize: safeSize,
+        fileType: safeType,
+        fileData: data,
+        data,
+        timestamp,
+        replyToId,
+        replyText,
+        replySender,
+        forwardedFrom
+      },
+      message: serializeMessageForClient(msgObj, fromUserId, secret)
+    };
+  }
+
+  const toId = pubcodes.get(normalizedToCode);
+  if (!toId || !users.has(toId)) throw new HttpError(404, 'User not found');
+
+  const secret = getConversationSecret(fromUserId, toId);
+  const msgObj = {
+    id: fileId,
+    from: fromUserId,
+    to: toId,
+    encrypted: encryptMessage(buildFilePreview(safeName), secret),
+    timestamp,
+    kind: 'file',
+    fileName: safeName,
+    fileSize: safeSize,
+    fileType: safeType,
+    fileData: data,
+    replyToId,
+    replyText,
+    replySender,
+    forwardedFrom
+  };
+  const convKey = getConvKey(fromUserId, toId);
+  const isFirst = !messages.has(convKey) || !messages.get(convKey).length;
+  await saveMessage(convKey, msgObj);
+
+  if (isFirst) {
+    sendToUserSockets(toId, buildChatStartedPayload(fileSender));
+  }
+  sendToUserSockets(toId, {
+    type: 'new_file',
+    id: fileId,
+    from: fileSender.publicCode,
+    fromName: fileSender.displayName || '',
+    username: fileSender.username || '',
+    avatar: fileSender.avatar || null,
+    publicCode: fileSender.publicCode,
+    displayName: fileSender.displayName || '',
+    fileName: safeName,
+    fileSize: safeSize,
+    fileType: safeType,
+    fileData: data,
+    data,
+    timestamp,
+    replyToId,
+    replyText,
+    replySender,
+    forwardedFrom
+  });
+  await sendPushToUser(toId, {
+    data: {
+      type: 'incoming_message',
+      publicCode: fileSender.publicCode,
+      displayName: fileSender.displayName || '',
+      fromName: fileSender.displayName || '',
+      username: fileSender.username || '',
+      avatar: fileSender.avatar || '',
+      fileName: safeName,
+      text: buildFilePreview(safeName),
+      timestamp: String(timestamp)
+    },
+    android: {
+      priority: 'high',
+      ttl: 60 * 60 * 1000,
+      directBootOk: true
+    }
+  });
+
+  return {
+    ackPayload: {
+      type: 'file_sent',
+      id: fileId,
+      to: normalizedToCode,
+      fileName: safeName,
+      fileSize: safeSize,
+      fileType: safeType,
+      fileData: data,
+      data,
+      timestamp,
+      replyToId,
+      replyText,
+      replySender,
+      forwardedFrom
+    },
+    message: serializeMessageForClient(msgObj, fromUserId, secret)
+  };
+}
+
+async function deleteOwnedMessage(fromUserId, toCode, messageId) {
+  if (!users.has(fromUserId)) throw new HttpError(401, 'Unauthorized');
+  const normalizedToCode = String(toCode || '').trim().toUpperCase();
+  const normalizedMessageId = typeof messageId === 'string' ? messageId.trim() : '';
+  if (!isValidPublicCode(normalizedToCode) || !normalizedMessageId) {
+    throw new HttpError(400, 'Invalid delete payload');
+  }
+
+  const group = getGroupByCode(normalizedToCode);
+  if (group) {
+    if (!group.members.has(fromUserId)) throw new HttpError(403, 'Access denied');
+    const convKey = getGroupConvKey(group.id);
+    const convMessages = messages.get(convKey) || [];
+    const targetMessage = convMessages.find(entry => entry.id === normalizedMessageId);
+    if (!targetMessage || targetMessage.from !== fromUserId) {
+      throw new HttpError(403, 'Cannot delete this message');
+    }
+    await deleteMessageRecord(convKey, normalizedMessageId);
+    const payload = {
+      type: 'message_deleted',
+      ...buildGroupSocketMeta(group),
+      id: normalizedMessageId,
+      from: users.get(fromUserId)?.publicCode || '',
+      to: normalizedToCode,
+      timestamp: Date.now()
+    };
+    for (const memberId of group.members) {
+      sendToUserSockets(memberId, payload);
+    }
+    return payload;
+  }
+
+  const toId = pubcodes.get(normalizedToCode);
+  if (!toId || !users.has(toId)) throw new HttpError(404, 'User not found');
+
+  const convKey = getConvKey(fromUserId, toId);
+  const convMessages = messages.get(convKey) || [];
+  const targetMessage = convMessages.find(entry => entry.id === normalizedMessageId);
+  if (!targetMessage || targetMessage.from !== fromUserId) {
+    throw new HttpError(403, 'Cannot delete this message');
+  }
+
+  await deleteMessageRecord(convKey, normalizedMessageId);
+  const payload = {
+    type: 'message_deleted',
+    id: normalizedMessageId,
+    from: users.get(fromUserId)?.publicCode || '',
+    publicCode: users.get(fromUserId)?.publicCode || '',
+    to: normalizedToCode,
+    timestamp: Date.now()
+  };
+  sendToUserSockets(toId, payload);
+  return payload;
 }
 
 function isValidUserId(id) {
@@ -1182,7 +1684,59 @@ app.post('/api/messages', (req, res) => {
   res.json(decrypted);
 });
 
+app.post('/api/messages/send', async (req, res) => {
+  const userId = resolveSession(req.body.token);
+  if (!userId || !users.has(userId)) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    const result = await createTextMessage(userId, req.body.contactCode || req.body.to, req.body.text, req.body);
+    res.json({
+      ok: true,
+      realtime: websocketEnabled ? 'websocket' : 'http-only',
+      message: result.message
+    });
+  } catch (error) {
+    const status = error instanceof HttpError ? error.status : 500;
+    res.status(status).json({ error: error.message || 'Failed to send message' });
+  }
+});
+
+app.post('/api/messages/file', async (req, res) => {
+  const userId = resolveSession(req.body.token);
+  if (!userId || !users.has(userId)) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    const result = await createFileMessage(userId, req.body.contactCode || req.body.to, req.body);
+    res.json({
+      ok: true,
+      realtime: websocketEnabled ? 'websocket' : 'http-only',
+      message: result.message
+    });
+  } catch (error) {
+    const status = error instanceof HttpError ? error.status : 500;
+    res.status(status).json({ error: error.message || 'Failed to send file' });
+  }
+});
+
+app.post('/api/messages/delete', async (req, res) => {
+  const userId = resolveSession(req.body.token);
+  if (!userId || !users.has(userId)) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    const payload = await deleteOwnedMessage(userId, req.body.contactCode || req.body.to, req.body.messageId);
+    res.json({
+      ok: true,
+      id: payload.id,
+      timestamp: payload.timestamp
+    });
+  } catch (error) {
+    const status = error instanceof HttpError ? error.status : 500;
+    res.status(status).json({ error: error.message || 'Failed to delete message' });
+  }
+});
+
 // ─── WEBSOCKET ──────────────────────────────────────────
+if (wss) {
 wss.on('connection', (ws) => {
   let userId = null; // internal ID — resolved from session token
 
@@ -1787,14 +2341,13 @@ wss.on('connection', (ws) => {
         const toId = pubcodes.get(toCode);
         const callId = String(msg.callId || '');
         const call = getCallById(callId) || getCallByUser(userId);
-        if (call) {
-          clearCallTimeout(call);
-          call.answered = true;
-        }
+        if (!call || call.toId !== userId) return;
+        clearCallTimeout(call);
+        call.answered = true;
         if (toId) {
           sendToUserSockets(toId, {
             type: 'call_answer',
-            callId: call?.id || callId,
+            callId: call.id,
             from: users.get(userId)?.publicCode || '',
             publicCode: users.get(userId)?.publicCode || '',
             video: !!msg.video,
@@ -1849,6 +2402,7 @@ wss.on('connection', (ws) => {
     }
   });
 });
+}
 
 function broadcastOnlineStatus(userId, online) {
   const u = users.get(userId);
@@ -1860,15 +2414,90 @@ function broadcastOnlineStatus(userId, online) {
   }
 }
 
+const HOST = process.env.HOST || '0.0.0.0';
 const PORT = process.env.PORT || 3000;
-(async () => {
-  try {
-    await initDB();
-    await loadFromDB();
-    initFirebaseAdmin();
-  } catch (e) {
-    console.error('DB init failed:', e.message);
-    console.error('Running without persistent DB (data will be lost on restart)');
+let renderKeepaliveStarted = false;
+
+function resolveRenderKeepaliveTarget() {
+  const raw = String(process.env.NXMSG_KEEPALIVE_TARGET_URL || process.env.RENDER_EXTERNAL_URL || '').trim();
+  if (!raw) return '';
+  return raw.endsWith('/') ? raw.slice(0, -1) : raw;
+}
+
+function startRenderKeepalive() {
+  if (renderKeepaliveStarted || !runningOnRender || !renderKeepaliveEnabled) return;
+  if (process.env.RENDER_SERVICE_TYPE && process.env.RENDER_SERVICE_TYPE !== 'web') return;
+
+  const baseTarget = resolveRenderKeepaliveTarget();
+  if (!baseTarget) {
+    console.warn('[keepalive] Render keepalive is enabled, but no target URL was resolved.');
+    return;
   }
-  server.listen(PORT, () => console.log(`🔒 NXMSG server listening on port ${PORT}`));
-})();
+
+  let targetUrl;
+  try {
+    targetUrl = new URL('/health?source=render-keepalive', baseTarget).toString();
+  } catch (error) {
+    console.warn(`[keepalive] Invalid keepalive target "${baseTarget}": ${error.message}`);
+    return;
+  }
+
+  let inFlight = false;
+  const ping = async () => {
+    if (inFlight) return;
+    inFlight = true;
+    const startedAt = Date.now();
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), renderKeepaliveTimeoutMs);
+
+    try {
+      const response = await fetch(targetUrl, {
+        method: 'GET',
+        headers: { 'user-agent': 'nxmsg-render-keepalive/1.0' },
+        signal: controller.signal
+      });
+      console.log(`[keepalive] ${response.status} ${targetUrl} (${Date.now() - startedAt}ms)`);
+    } catch (error) {
+      console.warn(`[keepalive] ping failed: ${error.message}`);
+    } finally {
+      clearTimeout(timeoutId);
+      inFlight = false;
+    }
+  };
+
+  renderKeepaliveStarted = true;
+  setTimeout(() => {
+    void ping();
+    setInterval(() => {
+      void ping();
+    }, renderKeepaliveIntervalMs);
+  }, renderKeepaliveStartupDelayMs);
+
+  console.log(`[keepalive] enabled for Render: ${targetUrl} every ${renderKeepaliveIntervalMs}ms`);
+}
+
+server.on('clientError', (error, socket) => {
+  console.error('HTTP client error:', error.message);
+  if (socket.writable) {
+    socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+  }
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception:', error);
+});
+
+process.on('unhandledRejection', (error) => {
+  console.error('Unhandled rejection:', error);
+});
+
+module.exports = app;
+
+if (require.main === module) {
+  startupPromise.finally(() => {
+    server.listen(PORT, HOST, () => {
+      console.log(`NXMSG server listening on ${HOST}:${PORT} (${websocketEnabled ? 'ws' : 'http-only'})`);
+      startRenderKeepalive();
+    });
+  });
+}

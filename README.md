@@ -1,49 +1,44 @@
 # NXMSG Server Release
 
-Backend release bundle for:
+This folder is the GitHub-ready server package for Render deploys.
 
-- NXMSG website
-- native Android client
-- Railway deployment
-
-## Included
+## Included files
 
 - `server.js`
 - `package.json`
-- `railway.json`
+- `package-lock.json`
 - `.env.example`
-- `public/index.html`
+- `render.yaml`
+- `public/`
 
-## Features
+## Deployment target
 
-- register / login / session restore
-- contact list and message history
-- WebSocket live messaging
-- call signaling
-- avatar upload and persistence
-- device push token storage
-- FCM push for incoming messages and calls
-- `/health` endpoint for Railway health checks
+- Platform: Render web service
+- Realtime: WebSocket enabled by default
+- Fallback API: HTTP endpoints remain available
+- Calls: supported with WebSocket signaling
 
-## Railway setup
+## Keepalive
 
-1. Push this folder to a GitHub repository.
-2. Create a new Railway project from that repository.
-3. Add a PostgreSQL plugin or connect an existing database.
-4. Set environment variables from `.env.example`.
-5. Railway will run `npm start` automatically.
+The server includes an internal keepalive loop for free Render instances.
 
-## Environment variables
+- Default interval: 5 minutes
+- Default target: `RENDER_EXTERNAL_URL`
+- Optional override: `NXMSG_KEEPALIVE_TARGET_URL`
 
-- `PORT`
+Important: if you keep a free Render service awake all month, it will consume almost all included free instance hours.
+
+## Required environment variables
+
 - `DATABASE_URL`
+
+Optional:
+
 - `FIREBASE_SERVICE_ACCOUNT_JSON`
 - `FIREBASE_SERVICE_ACCOUNT_JSON_BASE64`
+- `NXMSG_STUN_URL`
+- `NXMSG_TURN_URL`
+- `NXMSG_TURN_USERNAME`
+- `NXMSG_TURN_PASSWORD`
 
-Use either raw Firebase service account JSON or its base64 version.
-
-## Notes
-
-- The server is ready for `https` + `wss` deployment behind Railway.
-- Push notifications require valid Firebase credentials.
-- Native Android client should point to the Railway public URL in its build config.
+See `RENDER_SETUP.md` for the deployment steps.
