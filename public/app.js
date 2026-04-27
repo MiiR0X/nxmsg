@@ -912,10 +912,15 @@
   }
 
   async function loadContacts() {
-    const contacts = await requestJson('/api/contacts', {
+    const response = await requestJson('/api/contacts', {
       method: 'POST',
       body: { token: state.token }
     });
+    // Server may return either a bare array (legacy) or { contacts: [...] }
+    const contacts = Array.isArray(response)
+      ? response
+      : (Array.isArray(response?.contacts) ? response.contacts
+        : (Array.isArray(response?.items) ? response.items : []));
     const seen = new Set();
     contacts.forEach(contact => {
       seen.add(contact.publicCode);
@@ -942,13 +947,17 @@
   }
 
   async function loadMessages(chatCode) {
-    const payload = await requestJson('/api/messages', {
+    const response = await requestJson('/api/messages', {
       method: 'POST',
       body: {
         token: state.token,
         contactCode: chatCode
       }
     });
+    const payload = Array.isArray(response)
+      ? response
+      : (Array.isArray(response?.messages) ? response.messages
+        : (Array.isArray(response?.items) ? response.items : []));
     const chat = upsertChat({ publicCode: chatCode });
     chat.messages = payload.map(cloneMessage).sort((left, right) => left.timestamp - right.timestamp);
     if (chat.messages.length) {
@@ -2391,7 +2400,11 @@
         closeModal('modal-new-chat');
         showCreateGroup();
       };
-      const scanButton = newChatModal.querySelector('button[onclick="showScanModal()"]');
+      // Match the static "Scan QR" button by id first; fall back to the
+      // legacy onclick attribute for older HTML.
+      const scanButton =
+        document.getElementById('new-chat-scan-btn') ||
+        newChatModal.querySelector('button[onclick="showScanModal()"]');
       if (scanButton) {
         scanButton.before(groupButton);
       } else {
@@ -2399,38 +2412,41 @@
       }
     }
 
+    // NOTE: inline `onclick="..."` attributes are blocked by our CSP
+    // (script-src 'self' has no 'unsafe-inline'). All handlers are wired
+    // via addEventListener below.
     document.body.insertAdjacentHTML('beforeend', `
       <div class="modal-overlay" id="modal-message-actions">
         <div class="modal">
-          <div class="modal-title">Message <button class="modal-close" onclick="closeModal('modal-message-actions')">✕</button></div>
+          <div class="modal-title">Message <button class="modal-close" id="modal-message-actions-close">✕</button></div>
           <div class="live-sheet-stack" id="message-actions-body"></div>
         </div>
       </div>
 
       <div class="modal-overlay" id="modal-forward">
         <div class="modal">
-          <div class="modal-title">Forward <button class="modal-close" onclick="closeModal('modal-forward')">✕</button></div>
+          <div class="modal-title">Forward <button class="modal-close" id="modal-forward-close">✕</button></div>
           <div class="live-sheet-stack" id="forward-list"></div>
         </div>
       </div>
 
       <div class="modal-overlay" id="modal-group">
         <div class="modal">
-          <div class="modal-title">Create group <button class="modal-close" onclick="closeModal('modal-group')">✕</button></div>
+          <div class="modal-title">Create group <button class="modal-close" id="modal-group-close">✕</button></div>
           <input type="text" id="group-name-input" class="input" placeholder="Group name" maxlength="32" autocomplete="off">
           <textarea id="group-members-input" class="input" rows="3" placeholder="@username or code, separated by spaces or commas"></textarea>
           <div class="input-hint">// You will be added automatically</div>
-          <button class="btn btn-primary" onclick="createGroupFromModal()">Create group</button>
-          <button class="btn btn-ghost" onclick="closeModal('modal-group')">Cancel</button>
+          <button class="btn btn-primary" id="modal-group-create-btn">Create group</button>
+          <button class="btn btn-ghost" id="modal-group-cancel-btn">Cancel</button>
         </div>
       </div>
 
       <div class="modal-overlay" id="modal-add-member">
         <div class="modal">
-          <div class="modal-title">Add member <button class="modal-close" onclick="closeModal('modal-add-member')">✕</button></div>
+          <div class="modal-title">Add member <button class="modal-close" id="modal-add-member-close">✕</button></div>
           <input type="text" id="member-input" class="input" placeholder="@username or 12-character code" autocomplete="off">
-          <button class="btn btn-primary" onclick="addGroupMemberFromModal()">Add</button>
-          <button class="btn btn-ghost" onclick="closeModal('modal-add-member')">Cancel</button>
+          <button class="btn btn-primary" id="modal-add-member-add-btn">Add</button>
+          <button class="btn btn-ghost" id="modal-add-member-cancel-btn">Cancel</button>
         </div>
       </div>
 
@@ -2456,6 +2472,16 @@
       </div>
     `);
 
+    // Wire CSP-safe handlers for the modals injected above.
+    $('modal-message-actions-close')?.addEventListener('click', () => closeModal('modal-message-actions'));
+    $('modal-forward-close')?.addEventListener('click', () => closeModal('modal-forward'));
+    $('modal-group-close')?.addEventListener('click', () => closeModal('modal-group'));
+    $('modal-group-create-btn')?.addEventListener('click', () => createGroupFromModal());
+    $('modal-group-cancel-btn')?.addEventListener('click', () => closeModal('modal-group'));
+    $('modal-add-member-close')?.addEventListener('click', () => closeModal('modal-add-member'));
+    $('modal-add-member-add-btn')?.addEventListener('click', () => addGroupMemberFromModal());
+    $('modal-add-member-cancel-btn')?.addEventListener('click', () => closeModal('modal-add-member'));
+
     $('call-accept-btn').onclick = acceptIncomingCall;
     $('call-decline-btn').onclick = declineIncomingCall;
     $('call-end-btn').onclick = endCurrentCall;
@@ -2468,6 +2494,78 @@
   }
 
   function bindEvents() {
+    const bindClick = (id, handler) => {
+      $(id)?.addEventListener('click', handler);
+    };
+    const openLogoutModal = () => {
+      $('logout-confirm-input').value = '';
+      const error = $('logout-error');
+      if (error) {
+        error.textContent = '';
+        error.style.display = 'none';
+      }
+      openModal('modal-logout');
+    };
+
+    // CSP blocks inline onclick handlers, so wire the static UI here.
+    bindClick('welcome-register-btn', () => {
+      tryFullscreen();
+      showScreen('screen-register');
+    });
+    bindClick('welcome-login-btn', () => {
+      tryFullscreen();
+      showScreen('screen-login');
+    });
+    bindClick('reg-btn', () => { void doRegister(); });
+    bindClick('reg-back-btn', () => showScreen('screen-welcome'));
+    bindClick('login-btn', () => { void doLogin(); });
+    bindClick('login-back-btn', () => showScreen('screen-welcome'));
+    bindClick('my-qr-btn', () => { void showMyQR(); });
+    bindClick('new-chat-btn', showNewChat);
+    bindClick('settings-btn', showSettings);
+    bindClick('logout-btn', openLogoutModal);
+    bindClick('notif-banner-enable-btn', () => { void requestNotifPermission(); });
+    bindClick('notif-banner-dismiss-btn', dismissNotifBanner);
+    bindClick('chat-back-btn', closeChat);
+    bindClick('rename-contact-btn', showRenameContact);
+    bindClick('attach-btn', () => $('file-input')?.click());
+    bindClick('send-btn', () => { void sendMessage(); });
+    bindClick('qr-close-btn', () => closeModal('modal-qr'));
+    bindClick('qr-copy-btn', () => {
+      void copyMyCode();
+      closeModal('modal-qr');
+    });
+    bindClick('new-chat-close-btn', () => closeModal('modal-new-chat'));
+    bindClick('new-chat-start-btn', () => { void startNewChat(); });
+    bindClick('new-chat-scan-btn', () => { void showScanModal(); });
+    bindClick('scan-close-btn', stopScan);
+    bindClick('scan-cancel-btn', stopScan);
+    bindClick('settings-close-btn', () => closeModal('modal-settings'));
+    bindClick('my-avatar-box', () => $('avatar-input')?.click());
+    bindClick('avatar-upload-btn', () => $('avatar-input')?.click());
+    bindClick('avatar-remove-btn', () => { void removeAvatar(); });
+    bindClick('settings-copy-code-btn', () => { void copyMyCode(); });
+    bindClick('notif-request-btn', () => { void requestNotifPermission(); });
+    bindClick('theme-dark-btn', () => setTheme('dark'));
+    bindClick('theme-light-btn', () => setTheme('light'));
+    bindClick('fullscreen-btn', toggleFullscreen);
+    bindClick('settings-save-btn', () => { void saveSettings(); });
+    bindClick('rename-close-btn', () => closeModal('modal-rename'));
+    bindClick('rename-save-btn', () => { void saveRenameContact(); });
+    bindClick('rename-clear-btn', clearRenameContact);
+    bindClick('logout-close-btn', () => closeModal('modal-logout'));
+    bindClick('logout-confirm-btn', () => { void confirmLogout(); });
+    bindClick('logout-cancel-btn', () => closeModal('modal-logout'));
+    bindClick('lightbox-close-btn', event => {
+      event.stopPropagation();
+      closeLightbox();
+    });
+    $('lightbox')?.addEventListener('click', event => {
+      if (event.target === $('lightbox')) closeLightbox();
+    });
+    $('file-input')?.addEventListener('change', handleFileSelect);
+    $('avatar-input')?.addEventListener('change', handleAvatarUpload);
+
     document.addEventListener('fullscreenchange', updateFullscreenBtn);
     document.addEventListener('webkitfullscreenchange', updateFullscreenBtn);
     window.addEventListener('resize', updateChatLayout);
@@ -2493,6 +2591,9 @@
     $('login-code').addEventListener('input', function() {
       if (!this.value.startsWith('@')) this.value = this.value.toUpperCase();
     });
+    $('reg-pass').addEventListener('keydown', event => {
+      if (event.key === 'Enter') $('reg-pass2').focus();
+    });
     $('login-pass').addEventListener('keydown', event => {
       if (event.key === 'Enter') void doLogin();
     });
@@ -2516,17 +2617,40 @@
   }
 
   async function boot() {
-    injectLiveUi();
-    bindEvents();
-    applyTheme(LS.load('nxmsg_theme') || 'dark');
-    updateFullscreenBtn();
-    updateNotifStatusUI();
-    clearAuthErrors();
+    // Each step is guarded so a failure in one (e.g. an injected element
+    // missing in the static HTML) cannot leave the user stuck on the
+    // welcome screen with dead "Login"/"Register" buttons.
+    try { injectLiveUi(); } catch (e) { console.error('[boot] injectLiveUi failed:', e); }
+    try { bindEvents(); } catch (e) { console.error('[boot] bindEvents failed:', e); }
+    try { applyTheme(LS.load('nxmsg_theme') || 'dark'); } catch (e) { console.error(e); }
+    try { updateFullscreenBtn(); } catch (e) { console.error(e); }
+    try { updateNotifStatusUI(); } catch (e) { console.error(e); }
+    try { clearAuthErrors(); } catch (e) { console.error(e); }
 
-    const restored = await restoreSession();
+    // Always wire up welcome-screen buttons defensively, in case
+    // bindEvents threw before reaching them.
+    document.getElementById('welcome-register-btn')?.addEventListener('click', () => {
+      try { tryFullscreen(); } catch {}
+      showScreen('screen-register');
+    });
+    document.getElementById('welcome-login-btn')?.addEventListener('click', () => {
+      try { tryFullscreen(); } catch {}
+      showScreen('screen-login');
+    });
+
+    let restored = false;
+    try {
+      restored = await restoreSession();
+    } catch (e) {
+      console.error('[boot] restoreSession failed:', e);
+    }
     if (restored) {
-      await initApp(false);
-      return;
+      try {
+        await initApp(false);
+        return;
+      } catch (e) {
+        console.error('[boot] initApp failed, falling back to welcome:', e);
+      }
     }
     showScreen('screen-welcome');
   }
