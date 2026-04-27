@@ -1402,17 +1402,20 @@ function getFirebaseServiceAccount() {
   const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
   const base64Json = process.env.FIREBASE_SERVICE_ACCOUNT_JSON_BASE64;
   try {
-    if (filePath) {
-      const fs = require('fs');
-      const path = require('path');
-      const resolved = path.isAbsolute(filePath) ? filePath : path.resolve(__dirname, filePath);
-      return JSON.parse(fs.readFileSync(resolved, 'utf8'));
-    }
     if (rawJson) {
       return JSON.parse(rawJson);
     }
     if (base64Json) {
       return JSON.parse(Buffer.from(base64Json, 'base64').toString('utf8'));
+    }
+    if (filePath) {
+      const fs = require('fs');
+      const path = require('path');
+      const resolved = path.isAbsolute(filePath) ? filePath : path.resolve(__dirname, filePath);
+      if (fs.existsSync(resolved)) {
+        return JSON.parse(fs.readFileSync(resolved, 'utf8'));
+      }
+      console.warn(`Firebase service account file not found at ${resolved}.`);
     }
   } catch (e) {
     console.error('Firebase service account parse error:', e.message);
