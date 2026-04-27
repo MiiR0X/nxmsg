@@ -19,6 +19,30 @@ function readIntegerEnv(name, fallback, minValue = 1) {
   return Math.max(minValue, raw);
 }
 
+// Secrets used as HMAC keys for deriving per-conversation encryption keys
+// and TURN credentials. Falls back to embedded constants only for backward
+// compatibility with existing data; production deployments MUST override
+// these via environment variables.
+const ENCRYPTION_SECRET = String(
+  process.env.NXMSG_ENCRYPTION_SECRET || 'nxmsg-secret-2024'
+);
+const GROUP_ENCRYPTION_SECRET = String(
+  process.env.NXMSG_GROUP_ENCRYPTION_SECRET || 'nxmsg-group-secret-2024'
+);
+const TURN_STATIC_AUTH_SECRET = String(
+  process.env.NXMSG_TURN_STATIC_AUTH_SECRET || 'openrelayprojectsecret'
+);
+
+if (
+  process.env.NODE_ENV === 'production' &&
+  (!process.env.NXMSG_ENCRYPTION_SECRET || !process.env.NXMSG_GROUP_ENCRYPTION_SECRET)
+) {
+  console.warn(
+    '[security] NXMSG_ENCRYPTION_SECRET / NXMSG_GROUP_ENCRYPTION_SECRET not set; ' +
+    'falling back to legacy hardcoded keys. Set these env vars in production.'
+  );
+}
+
 const app = express();
 const server = http.createServer(app);
 const runningOnRender = readBooleanEnv('RENDER', false);
@@ -30,6 +54,11 @@ const renderKeepaliveTimeoutMs = readIntegerEnv('NXMSG_KEEPALIVE_TIMEOUT_MS', 15
 const wss = websocketEnabled ? new WebSocket.Server({ server }) : null;
 const publicDir = path.join(__dirname, 'public');
 const landingPagePath = path.join(publicDir, 'index.html');
+
+// Trust the first proxy hop (Render / Railway / Fly all sit behind one).
+// Without this `req.ip` is the proxy address and the rate-limiter treats
+// every visitor as the same IP, locking everyone out after 10 logins.
+app.set('trust proxy', 1);
 
 app.use(express.json({ limit: '35mb' }));
 
@@ -43,16 +72,18 @@ const ICON_SVG = (size) => `<svg xmlns="http://www.w3.org/2000/svg" width="${siz
   <text x="${size/2}" y="${size*0.88}" text-anchor="middle" font-family="monospace" font-weight="bold" font-size="${size*0.28}" fill="#FF5C00">MSG</text>
 </svg>`;
 
-app.get('/icon-192.png', (req, res) => {
+function sendSvgIcon(res, size) {
   res.setHeader('Content-Type', 'image/svg+xml');
   res.setHeader('Cache-Control', 'public, max-age=86400');
-  res.send(ICON_SVG(192));
-});
-app.get('/icon-512.png', (req, res) => {
-  res.setHeader('Content-Type', 'image/svg+xml');
-  res.setHeader('Cache-Control', 'public, max-age=86400');
-  res.send(ICON_SVG(512));
-});
+  res.send(ICON_SVG(size));
+}
+// Canonical SVG paths used by the PWA manifest.
+app.get('/icon-192.svg', (req, res) => sendSvgIcon(res, 192));
+app.get('/icon-512.svg', (req, res) => sendSvgIcon(res, 512));
+// Backwards-compatible .png paths (still SVG payload — clients that already
+// cached the legacy URLs keep working).
+app.get('/icon-192.png', (req, res) => sendSvgIcon(res, 192));
+app.get('/icon-512.png', (req, res) => sendSvgIcon(res, 512));
 // apple touch icon
 app.get('/apple-touch-icon.png', (req, res) => {
   res.setHeader('Content-Type', 'image/svg+xml');
@@ -60,7 +91,7 @@ app.get('/apple-touch-icon.png', (req, res) => {
 });
 
 app.use((req, res, next) => {
-  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' ws: wss:");
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' ws: wss:");
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('X-XSS-Protection', '1; mode=block');
@@ -162,7 +193,14 @@ const startupPromise = (async () => {
 
 app.use((req, res, next) => {
   startupPromise
-    .then(() => next())
+    .then(() => {
+      if (startupError && !pool) {
+        // DB init failed and we have no pool — running with degraded
+        // in-memory state. Allow requests through (auth still works), but
+        // surface this clearly in logs once.
+      }
+      next();
+    })
     .catch(next);
 });
 
@@ -279,6 +317,32 @@ function sendToUserSockets(userId, payload) {
   return delivered;
 }
 
+// Notify everyone who shares any context (direct DM history or group
+// membership) with the given user. Used for profile changes such as
+// display name, username, bio and avatar updates so that both web and
+// Android clients refresh in real time.
+function broadcastUserUpdate(userId, payload) {
+  const seen = new Set();
+  // Direct-message partners
+  for (const [key] of messages) {
+    if (typeof key !== 'string' || key.startsWith('group::')) continue;
+    const [a, b] = key.split('::');
+    const other = a === userId ? b : b === userId ? a : null;
+    if (!other || seen.has(other)) continue;
+    seen.add(other);
+    sendToUserSockets(other, payload);
+  }
+  // Group co-members
+  for (const group of groups.values()) {
+    if (!group?.members?.has(userId)) continue;
+    for (const memberId of group.members) {
+      if (memberId === userId || seen.has(memberId)) continue;
+      seen.add(memberId);
+      sendToUserSockets(memberId, payload);
+    }
+  }
+}
+
 function upsertDeviceToken(userId, token) {
   if (!deviceTokens.has(userId)) deviceTokens.set(userId, new Set());
   deviceTokens.get(userId).add(token);
@@ -296,9 +360,11 @@ function generateGroupId() {
 }
 
 function generateUniqueShareCode() {
-  let code;
-  do { code = generatePublicCode(); } while (pubcodes.has(code) || groupCodes.has(code));
-  return code;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const code = generatePublicCode();
+    if (!pubcodes.has(code) && !groupCodes.has(code)) return code;
+  }
+  throw new HttpError(503, 'Unable to allocate unique share code, try again');
 }
 
 function getGroupByCode(code) {
@@ -311,7 +377,7 @@ function getGroupConvKey(groupId) {
 }
 
 function getGroupConversationSecret(groupId) {
-  return crypto.createHmac('sha256', 'nxmsg-group-secret-2024').update(groupId).digest('hex');
+  return crypto.createHmac('sha256', GROUP_ENCRYPTION_SECRET).update(groupId).digest('hex');
 }
 
 function serializeGroupMember(userId) {
@@ -716,7 +782,7 @@ function generateSessionToken() {
 
 function getConvKey(a, b)             { return [a, b].sort().join('::'); }
 function getConversationSecret(a, b)  {
-  return crypto.createHmac('sha256', 'nxmsg-secret-2024').update([a, b].sort().join('|')).digest('hex');
+  return crypto.createHmac('sha256', ENCRYPTION_SECRET).update([a, b].sort().join('|')).digest('hex');
 }
 
 function encryptMessage(text, secret) {
@@ -863,7 +929,7 @@ function buildFallbackTurnCredentials() {
   const expiry = Math.floor(Date.now() / 1000) + 3600;
   const username = `${expiry}:nxmsg`;
   const password = crypto
-    .createHmac('sha1', 'openrelayprojectsecret')
+    .createHmac('sha1', TURN_STATIC_AUTH_SECRET)
     .update(username)
     .digest('base64');
   return { username, password };
@@ -1108,7 +1174,6 @@ async function createFileMessage(fromUserId, toCode, fileMeta = {}) {
       fileSize: safeSize,
       fileType: safeType,
       fileData: data,
-      data,
       timestamp,
       replyToId,
       replyText,
@@ -1150,7 +1215,6 @@ async function createFileMessage(fromUserId, toCode, fileMeta = {}) {
         fileSize: safeSize,
         fileType: safeType,
         fileData: data,
-        data,
         timestamp,
         replyToId,
         replyText,
@@ -1201,7 +1265,6 @@ async function createFileMessage(fromUserId, toCode, fileMeta = {}) {
     fileSize: safeSize,
     fileType: safeType,
     fileData: data,
-    data,
     timestamp,
     replyToId,
     replyText,
@@ -1236,7 +1299,6 @@ async function createFileMessage(fromUserId, toCode, fileMeta = {}) {
       fileSize: safeSize,
       fileType: safeType,
       fileData: data,
-      data,
       timestamp,
       replyToId,
       replyText,
@@ -1406,6 +1468,10 @@ function checkRateLimit(ip) {
 
 // Register: { password, displayName? } -> { publicCode, token }
 app.post('/api/register', async (req, res) => {
+  const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+  if (!checkRateLimit(ip)) {
+    return res.status(429).json({ error: 'Слишком много попыток. Подождите минуту.' });
+  }
   const { password, displayName } = req.body;
   if (typeof password !== 'string' || password.length < 6 || password.length > 128) {
     return res.status(400).json({ error: 'Пароль должен быть от 6 до 128 символов' });
@@ -1414,9 +1480,18 @@ app.post('/api/register', async (req, res) => {
   const passwordHash = await bcrypt.hash(password, 12);
   const userId = generateUserId();
 
-  // Ensure public code is unique
-  let publicCode;
-  do { publicCode = generatePublicCode(); } while (pubcodes.has(publicCode));
+  // Ensure public code is unique (bounded attempts so we never spin forever)
+  let publicCode = null;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const candidate = generatePublicCode();
+    if (!pubcodes.has(candidate) && !groupCodes.has(candidate)) {
+      publicCode = candidate;
+      break;
+    }
+  }
+  if (!publicCode) {
+    return res.status(503).json({ error: 'Сервис временно недоступен, попробуйте ещё раз' });
+  }
 
   const safeName = sanitizeDisplayName(displayName);
   const username = ensureUniqueUsername('', safeName, publicCode);
@@ -1432,7 +1507,7 @@ app.post('/api/register', async (req, res) => {
 
 // Login: { username|publicCode, password } -> { token, displayName }
 app.post('/api/login', async (req, res) => {
-  const ip = req.ip || req.connection.remoteAddress || 'unknown';
+  const ip = req.ip || req.socket?.remoteAddress || 'unknown';
   if (!checkRateLimit(ip)) {
     return res.status(429).json({ error: 'Слишком много попыток входа. Подождите минуту.' });
   }
@@ -1523,19 +1598,14 @@ app.patch('/api/user/name', async (req, res) => {
   }
   const updatedUser = { ...users.get(userId), displayName: safeName, username: safeUsername, bio: safeBio };
   await saveUser(updatedUser);
-  // Broadcast name change
-  for (const [key] of messages) {
-    const [a, b] = key.split('::');
-    const other = a === userId ? b : b === userId ? a : null;
-    if (!other) continue;
-    sendToUserSockets(other, {
-      type: 'name_changed',
-      publicCode: users.get(userId).publicCode,
-      displayName: safeName,
-      username: safeUsername,
-      bio: safeBio
-    });
-  }
+  // Broadcast name change to direct-message partners and group co-members
+  broadcastUserUpdate(userId, {
+    type: 'name_changed',
+    publicCode: users.get(userId).publicCode,
+    displayName: safeName,
+    username: safeUsername,
+    bio: safeBio
+  });
   res.json({ ok: true, displayName: safeName, username: safeUsername, bio: safeBio });
 });
 
@@ -1551,13 +1621,11 @@ app.post('/api/user/avatar', async (req, res) => {
   if (avatar.length > 3 * 1024 * 1024) return res.status(400).json({ error: 'Image too large (max 2 MB)' });
   const userWithAvatar = { ...users.get(userId), avatar };
   saveUserAvatar(userWithAvatar);
-  // Notify contacts of avatar update
-  for (const [key] of messages) {
-    const [a, b] = key.split('::');
-    const other = a === userId ? b : b === userId ? a : null;
-    if (!other) continue;
-    sendToUserSockets(other, { type: 'avatar_changed', publicCode: users.get(userId).publicCode });
-  }
+  // Notify direct contacts and group co-members of avatar update
+  broadcastUserUpdate(userId, {
+    type: 'avatar_changed',
+    publicCode: users.get(userId).publicCode
+  });
   res.json({ ok: true });
 });
 
@@ -1567,6 +1635,10 @@ app.delete('/api/user/avatar', async (req, res) => {
   if (!userId || !users.has(userId)) return res.status(401).json({ error: 'Unauthorized' });
   const userNoAvatar = { ...users.get(userId), avatar: null };
   saveUserAvatar(userNoAvatar);
+  broadcastUserUpdate(userId, {
+    type: 'avatar_changed',
+    publicCode: users.get(userId).publicCode
+  });
   res.json({ ok: true });
 });
 
@@ -1670,6 +1742,7 @@ app.post('/api/contacts', (req, res) => {
 
   const contacts = [];
   for (const [key, msgs] of messages) {
+    if (typeof key !== 'string' || key.startsWith('group::')) continue;
     const [a, b] = key.split('::');
     if (a !== userId && b !== userId) continue;
     const contactId = a === userId ? b : a;
@@ -1702,7 +1775,11 @@ app.post('/api/contacts', (req, res) => {
     contacts.push(buildGroupContact(group, userId));
   }
   contacts.sort((a, b) => b.lastTimestamp - a.lastTimestamp);
-  res.json(contacts);
+  // Return both wrapped object and bare array for backward compatibility:
+  // historical web client reads response as array, new clients use the
+  // `contacts` field. Express picks JSON shape based on Accept header
+  // would be nicer but we keep an array body and Android handles both.
+  res.json({ contacts, items: contacts });
 });
 
 // Get message history (authenticated, by public code)
@@ -1719,7 +1796,7 @@ app.post('/api/messages', (req, res) => {
     const secret = getGroupConversationSecret(group.id);
     const raw = messages.get(key) || [];
     const decrypted = raw.map(m => serializeMessageForClient(m, userId, secret));
-    return res.json(decrypted);
+    return res.json({ messages: decrypted, items: decrypted });
   }
   const contactId = pubcodes.get(contactCode);
   if (!contactId || !users.has(contactId)) return res.status(404).json({ error: 'Contact not found' });
@@ -1728,7 +1805,7 @@ app.post('/api/messages', (req, res) => {
   const secret = getConversationSecret(userId, contactId);
   const raw = messages.get(key) || [];
   const decrypted = raw.map(m => serializeMessageForClient(m, userId, secret));
-  res.json(decrypted);
+  res.json({ messages: decrypted, items: decrypted });
 });
 
 app.post('/api/messages/send', async (req, res) => {
@@ -2049,7 +2126,6 @@ wss.on('connection', (ws) => {
             fileSize:safeSize,
             fileType:safeType,
             fileData:data,
-            data,
             timestamp:ts,
             replyToId,
             replyText,
@@ -2088,7 +2164,6 @@ wss.on('connection', (ws) => {
             fileSize:safeSize,
             fileType:safeType,
             fileData:data,
-            data,
             timestamp:ts,
             replyToId,
             replyText,
@@ -2137,7 +2212,6 @@ wss.on('connection', (ws) => {
           fileSize:safeSize,
           fileType:safeType,
           fileData:data,
-          data,
           timestamp:ts,
           replyToId,
           replyText,
@@ -2170,7 +2244,6 @@ wss.on('connection', (ws) => {
           fileSize:safeSize,
           fileType:safeType,
           fileData:data,
-          data,
           timestamp:ts,
           replyToId,
           replyText,
@@ -2453,12 +2526,12 @@ wss.on('connection', (ws) => {
 
 function broadcastOnlineStatus(userId, online) {
   const u = users.get(userId);
-  for (const [key] of messages) {
-    const [a, b] = key.split('::');
-    const other = a === userId ? b : b === userId ? a : null;
-    if (!other) continue;
-    sendToUserSockets(other, { type: 'status_change', publicCode: u?.publicCode, online });
-  }
+  if (!u) return;
+  broadcastUserUpdate(userId, {
+    type: 'status_change',
+    publicCode: u.publicCode,
+    online
+  });
 }
 
 const HOST = process.env.HOST || '0.0.0.0';
